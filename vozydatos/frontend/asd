@@ -1,0 +1,331 @@
+#include <Wire.h>
+#include <MPU6050.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <time.h> // Para la hora NTP
+
+// 🔵 Configuración WiFi
+#define WIFI_SSID "NICOLAS 2.4"
+#define WIFI_PASSWORD "C@RMEN1992"
+
+// 🤖 Bot de Telegram
+String botToken = "7922187076:AAFCFnGKyZ_bk4WS5ajl1IAV3lNqZAGmVFI"; // Asegúrate de que este token sea correcto y seguro
+String chatID = "7898000137"; // ID de tu chat o grupo de Telegram
+
+// 🎚 Sensor MPU6050
+MPU6050 mpu;
+
+// --- UMBRALES Y TIEMPOS DE DETECCIÓN (AJUSTA ESTOS VALORES TRAS LAS PRUEBAS) ---
+// Para Somnolencia (inclinación prolongada de la cabeza)
+const float UMBRAL_INCLINACION_SOMNOLENCIA = 0.5; // G's. Un valor más bajo detecta movimientos más sutiles.
+                                                 // SUGERENCIA: Prueba con 0.4, 0.3 o incluso 0.2 si la somnolencia es muy leve.
+const int TIEMPO_SOMNOLENCIA = 3000;             // ms. Tiempo que debe durar la inclinación (ej. 3 segundos).
+                                                 // SUGERENCIA: Ajusta según qué tan rápido quieres la alerta.
+const float UMBRAL_MOVIMIENTO_DESPERTA = 0.1;    // G's. Pequeño movimiento para cancelar una alerta de somnolencia.
+                                                 // SUGERENCIA: Debe ser un valor bajo, cerca de cero, pero no cero.
+
+// Para Agitación/Ira (movimientos bruscos)
+const float UMBRAL_BRUSQUEDAD = 3.0;             // G's. Umbral para movimientos muy rápidos y bruscos.
+                                                 // SUGERENCIA: Mantenerlo alto para evitar falsas alarmas con movimientos normales.
+
+// --- CONFIGURACIÓN DE INTERVALOS DE ALERTAS ---
+unsigned long ultimaAlertaSomnolencia = 0;
+const int INTERVALO_ALERTAS_SOMNOLENCIA = 60000; // ms. Mínimo 1 minuto entre alertas de somnolencia repetidas.
+
+unsigned long ultimaAlertaBrusquedad = 0;
+const int INTERVALO_ALERTAS_BRUSQUEDAD = 10000;  // ms. Mínimo 10 segundos entre alertas de brusquedad repetidas.
+
+// --- VARIABLES INTERNAS DEL SISTEMA ---
+unsigned long tiempoInclinacionSomnolencia = 0;
+unsigned long ultimoLedToggle = 0;
+const int LED_PIN = 2; // Pin del LED integrado del ESP32 (o ajusta si usas otro para activar el powerbank)
+
+float accelX_raw, accelY_raw, accelZ_raw; // Lecturas directas del acelerómetro
+float accelX, accelY, accelZ;             // Lecturas filtradas (usadas para la detección)
+bool alertaSomnolenciaActiva = false;    // Estado actual de la alerta de somnolencia
+
+// --- VARIABLES PARA EL FILTRO DE PROMEDIO MÓVIL ---
+// Este filtro suaviza las lecturas del sensor para reducir el ruido y mejorar la precisión.
+const int NUM_LECTURAS_FILTRO = 10; // Número de lecturas para calcular el promedio.
+                                    // Más lecturas = más suavizado, pero ligera latencia.
+                                    // Menos lecturas = más reactivo, pero menos suavizado.
+float accelX_buffer[NUM_LECTURAS_FILTRO];
+float accelY_buffer[NUM_LECTURAS_FILTRO];
+float accelZ_buffer[NUM_LECTURAS_FILTRO];
+int buffer_indice = 0; // Índice para el array circular
+bool buffer_lleno = false; // Indica si el buffer de lecturas ya se ha llenado al menos una vez
+
+
+// --- FUNCIÓN SETUP: Se ejecuta una vez al inicio ---
+void setup() {
+  Serial.begin(115200); // Inicia la comunicación serial para depuración
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW); // Asegura que el LED esté apagado al inicio
+
+  // Inicialización del sensor MPU6050 a través de I2C
+  // Wire.begin(21, 22); // Opcional: especificar SDA=GPIO21, SCL=GPIO22. Por defecto, Wire.begin() ya usa estos.
+  Wire.begin(); 
+  
+  mpu.initialize(); // Inicializa el MPU6050
+  if (!mpu.testConnection()) { // Verifica que el sensor esté conectado correctamente
+    Serial.println("❌ Error: No se pudo conectar con el sensor MPU6050. Verifique cableado.");
+    while (1); // Detiene la ejecución si el sensor no se conecta
+  }
+  Serial.println("✅ MPU6050 conectado correctamente.");
+
+  // Inicializa el buffer del filtro con ceros
+  for (int i = 0; i < NUM_LECTURAS_FILTRO; i++) {
+    accelX_buffer[i] = 0.0;
+    accelY_buffer[i] = 0.0;
+    accelZ_buffer[i] = 0.0;
+  }
+
+  conectarWiFi(); // Conecta el ESP32 a la red WiFi
+  configurarHoraPeru(); // Sincroniza la hora con un servidor NTP
+  enviarMensajeInicio(); // Envía un mensaje a Telegram confirmando el inicio del sistema
+}
+
+// --- FUNCIÓN LOOP: Se ejecuta repetidamente ---
+void loop() {
+  leerSensor(); // Lee y filtra los datos del acelerómetro
+  monitorearValores(); // Muestra los valores filtrados en el Monitor Serial (para depuración y calibración)
+  verificarEstados(); // Lógica principal para detectar somnolencia y agitación
+  mantenerPowerbankActivo(); // Función para evitar que el powerbank se apague
+  delay(20); // Pequeña pausa para permitir que el ESP32 realice otras tareas y no sature el bus I2C
+}
+
+// --- FUNCIONES AUXILIARES ---
+
+// Lee los datos del MPU6050 y aplica el filtro de promedio móvil
+void leerSensor() {
+  int16_t ax_raw_val, ay_raw_val, az_raw_val;
+  mpu.getAcceleration(&ax_raw_val, &ay_raw_val, &az_raw_val);
+  
+  // Convierte los valores brutos a G's y los guarda en el buffer circular
+  accelX_buffer[buffer_indice] = ax_raw_val / 16384.0;
+  accelY_buffer[buffer_indice] = ay_raw_val / 16384.0;
+  accelZ_buffer[buffer_indice] = az_raw_val / 16384.0;
+
+  // Avanza el índice y verifica si el buffer ya se ha llenado completamente
+  buffer_indice = (buffer_indice + 1) % NUM_LECTURAS_FILTRO;
+  if (buffer_indice == 0 && !buffer_lleno) {
+    buffer_lleno = true;
+  }
+
+  // Calcula el promedio móvil de las lecturas actuales en el buffer
+  if (buffer_lleno || buffer_indice > 0) { // Asegura que haya datos en el buffer
+    float sumX = 0, sumY = 0, sumZ = 0;
+    int count = buffer_lleno ? NUM_LECTURAS_FILTRO : buffer_indice; // Número de lecturas válidas
+
+    for (int i = 0; i < count; i++) {
+      sumX += accelX_buffer[i];
+      sumY += accelY_buffer[i];
+      sumZ += accelZ_buffer[i];
+    }
+    accelX = sumX / count; // Valores finales filtrados que se usarán para la detección
+    accelY = sumY / count;
+    accelZ = sumZ / count;
+  } else {
+    // Si el buffer aún se está llenando al inicio, usa la primera lectura directamente
+    accelX = accelX_buffer[0];
+    accelY = accelY_buffer[0];
+    accelZ = accelZ_buffer[0];
+  }
+}
+
+// Muestra los valores filtrados del acelerómetro en el Monitor Serial
+void monitorearValores() {
+  static unsigned long ultimoReporteMonitor = 0;
+  if (millis() - ultimoReporteMonitor > 1000) { // Reportar cada 1 segundo para no saturar
+    Serial.print("Acc. X (Filt): "); Serial.print(accelX, 2);
+    Serial.print(" | Acc. Y (Filt): "); Serial.print(accelY, 2);
+    Serial.print(" | Acc. Z (Filt): "); Serial.print(accelZ, 2);
+    Serial.println(" g");
+    ultimoReporteMonitor = millis();
+  }
+}
+
+// Lógica principal para verificar somnolencia y agitación
+void verificarEstados() {
+  // --- Detección de SOMNOLENCIA (inclinación prolongada de la cabeza) ---
+  // Se basa en si la magnitud de la aceleración en los ejes X o Y supera un umbral,
+  // indicando una inclinación significativa de la cabeza.
+  if (abs(accelX) > UMBRAL_INCLINACION_SOMNOLENCIA || abs(accelY) > UMBRAL_INCLINACION_SOMNOLENCIA) {
+    if (tiempoInclinacionSomnolencia == 0) {
+      // Si es la primera vez que se detecta la inclinación, inicia el contador
+      tiempoInclinacionSomnolencia = millis();
+    } else if (millis() - tiempoInclinacionSomnolencia > TIEMPO_SOMNOLENCIA && !alertaSomnolenciaActiva) {
+      // Si la inclinación se mantiene por el tiempo definido y la alerta no está activa
+      enviarAlertaTelegram("😴 ¡Somnolencia detectada! La persona podría estar quedándose dormida.");
+      alertaSomnolenciaActiva = true; // Activa la bandera para evitar alertas repetidas inmediatamente
+    }
+  } 
+  // Lógica para cancelar la alerta de somnolencia si la cabeza vuelve a una posición normal
+  else if (alertaSomnolenciaActiva && (abs(accelX) < UMBRAL_MOVIMIENTO_DESPERTA && abs(accelY) < UMBRAL_MOVIMIENTO_DESPERTA)) {
+    // Si la alerta estaba activa y la cabeza vuelve a una posición considerada normal
+    enviarMensajeTelegram("✅ Movimiento normal recuperado. Alerta de somnolencia cancelada.");
+    alertaSomnolenciaActiva = false; // Desactiva la bandera
+    tiempoInclinacionSomnolencia = 0; // Reinicia el contador de tiempo de inclinación
+  } 
+  // Si no hay inclinación significativa y la alerta no está activa, asegura que el contador esté reseteado
+  else if (!alertaSomnolenciaActiva && (abs(accelX) < UMBRAL_INCLINACION_SOMNOLENCIA && abs(accelY) < UMBRAL_INCLINACION_SOMNOLENCIA)) {
+    tiempoInclinacionSomnolencia = 0;
+  }
+
+  // --- Detección de IRA/AGITACIÓN (movimientos bruscos) ---
+  // Se calcula la magnitud total de la aceleración (vector suma de X, Y, Z)
+  // y se compara con un umbral alto para detectar movimientos repentinos y fuertes.
+  float currentAccelMagnitude = sqrt(accelX * accelX + accelY * accelY + accelZ * accelZ);
+  if (currentAccelMagnitude > UMBRAL_BRUSQUEDAD) {
+      if (millis() - ultimaAlertaBrusquedad > INTERVALO_ALERTAS_BRUSQUEDAD) {
+          enviarAlertaTelegram("😠 ¡Movimiento brusco detectado! Posible agitación o frustración.");
+          ultimaAlertaBrusquedad = millis(); // Actualiza el tiempo de la última alerta de brusquedad
+      }
+  }
+}
+
+// Envía un mensaje de alerta a Telegram, controlando el intervalo para evitar spam.
+// Esta función gestiona cuándo se puede enviar la próxima alerta del mismo tipo.
+void enviarAlertaTelegram(String mensaje) {
+  // Para somnolencia, usa su propio intervalo
+  if (mensaje.startsWith("😴") && (millis() - ultimaAlertaSomnolencia > INTERVALO_ALERTAS_SOMNOLENCIA)) {
+    enviarMensajeTelegram(mensaje);
+    ultimaAlertaSomnolencia = millis();
+  }
+  // Para brusquedad, usa su propio intervalo
+  else if (mensaje.startsWith("😠") && (millis() - ultimaAlertaBrusquedad > INTERVALO_ALERTAS_BRUSQUEDAD)) {
+    enviarMensajeTelegram(mensaje);
+    ultimaAlertaBrusquedad = millis();
+  }
+  // Para otros mensajes (como la recuperación), envía inmediatamente (puedes ajustar si necesitas intervalo aquí también)
+  else if (!mensaje.startsWith("😴") && !mensaje.startsWith("😠")) {
+    enviarMensajeTelegram(mensaje);
+  }
+}
+
+// Función general para enviar cualquier mensaje a Telegram (sin control de intervalo interno)
+void enviarMensajeTelegram(String mensaje) {
+  // Intenta reconectar WiFi si no hay conexión antes de enviar el mensaje
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("⚠ WiFi desconectado. Intentando reconectar...");
+    conectarWiFi(); 
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("❌ No se pudo reconectar al WiFi. Mensaje NO enviado.");
+      return; // No intenta enviar si no hay WiFi
+    }
+  }
+
+  HTTPClient http;
+  String url = "https://api.telegram.org/bot" + botToken + "/sendMessage?chat_id=" + chatID + "&text=" + urlEncode(mensaje);
+  
+  Serial.print("Enviando mensaje a Telegram: ");
+  Serial.println(mensaje);
+
+  http.begin(url); // Prepara la solicitud HTTP
+  int httpCode = http.GET(); // Envía la solicitud GET
+  if (httpCode > 0) { // Si el código HTTP es positivo, la solicitud fue exitosa
+    Serial.println("📤 Mensaje enviado a Telegram correctamente.");
+  } else { // Si hay un error
+    Serial.print("❌ Error enviando mensaje a Telegram. Código: ");
+    Serial.println(httpCode);
+    String response = http.getString(); // Intenta obtener la respuesta del servidor para más detalles
+    Serial.println("Respuesta del servidor: " + response); 
+  }
+  http.end(); // Cierra la conexión HTTP
+}
+
+// Conecta el ESP32 a la red WiFi configurada
+void conectarWiFi() {
+  Serial.print("Conectando a WiFi: ");
+  Serial.println(WIFI_SSID);
+  WiFi.mode(WIFI_STA); // Modo Estación (cliente)
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD); // Inicia la conexión
+  int intentos = 0;
+  while (WiFi.status() != WL_CONNECTED && intentos < 20) { // Intenta por un tiempo limitado
+    delay(500);
+    Serial.print(".");
+    intentos++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ WiFi conectado.");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP()); // Muestra la IP asignada
+  } else {
+    Serial.println("\n❌ No se pudo conectar al WiFi. Revise SSID/Contraseña o distancia.");
+    // Aquí podrías implementar un modo de ahorro de energía o reiniciar el ESP32 si la conexión falla repetidamente
+  }
+}
+
+// Mantiene el powerbank activo alternando un LED (o pin IO)
+void mantenerPowerbankActivo() {
+  // Si han pasado 10 segundos desde el último cambio de LED
+  if (millis() - ultimoLedToggle > 10000) { 
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN)); // Cambia el estado del LED (ON/OFF)
+    ultimoLedToggle = millis(); // Reinicia el contador
+  }
+}
+
+// Codifica una cadena de texto para ser segura en una URL (ej. para mensajes de Telegram)
+String urlEncode(String str) {
+  String encoded = "";
+  char c;
+  char code0;
+  char code1;
+  for (int i = 0; i < str.length(); i++) {
+    c = str.charAt(i);
+    if (isalnum(c)) { // Si es letra o número, lo añade directamente
+      encoded += c;
+    } else if (c == ' ') { // Los espacios se convierten en '+'
+      encoded += '+';
+    }
+    else { // Otros caracteres se codifican como %XX
+      encoded += '%';
+      code0 = (c >> 4) & 0xF;
+      code1 = c & 0xF;
+      encoded += char(code0 < 10 ? code0 + '0' : code0 - 10 + 'A');
+      encoded += char(code1 < 10 ? code1 + '0' : code1 - 10 + 'A');
+    }
+  }
+  return encoded;
+}
+
+// Configura la hora del ESP32 usando un servidor NTP para la zona horaria de Perú
+void configurarHoraPeru() {
+  // configTime(GMT_offset_sec, daylight_offset_sec, "servidor_ntp1", "servidor_ntp2");
+  // Perú es GMT-5 ( -5 * 3600 segundos )
+  configTime(-5 * 3600, 0, "pool.ntp.org", "time.nist.gov"); 
+  Serial.println("⏳ Sincronizando hora con NTP...");
+  struct tm timeinfo;
+  int retryCount = 0;
+  // Espera hasta que la hora se sincronice o se agoten los intentos
+  while (!getLocalTime(&timeinfo) && retryCount < 10) { 
+    Serial.print(".");
+    delay(1000); 
+    retryCount++;
+  }
+  if (retryCount == 10) {
+    Serial.println("\n❌ Fallo al sincronizar la hora. La hora en los mensajes podría ser incorrecta.");
+  } else {
+    Serial.println("\n🕒 Hora sincronizada correctamente.");
+  }
+}
+
+// Envía un mensaje inicial a Telegram con el estado del sistema
+void enviarMensajeInicio() {
+  struct tm timeinfo;
+  char horaStr[30];
+
+  String mensajeInicio = "🟢 Sistema ACTIVADO\n";
+  mensajeInicio += "📡 WiFi: " + String(WIFI_SSID) + "\n";
+  mensajeInicio += "📶 RSSI: " + String(WiFi.RSSI()) + " dBm\n"; // Intensidad de la señal WiFi
+
+  if (!getLocalTime(&timeinfo)) {
+    // Si no se pudo obtener la hora NTP, lo indica
+    mensajeInicio += "🕒 Hora de inicio: No disponible (Error NTP)";
+  } else {
+    // Formatea la hora y la añade al mensaje
+    strftime(horaStr, sizeof(horaStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    mensajeInicio += "🕒 Hora de inicio: " + String(horaStr);
+  }
+  enviarMensajeTelegram(mensajeInicio);
+}

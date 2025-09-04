@@ -1,0 +1,1 @@
+{"version":1,"defects":{"UserServiceTest::testUsuarioNoExiste":4,"UserServiceTest::testContarUsuariosActivos":4},"times":{"UserServiceTest::testUsuarioNoExiste":0.006,"UserServiceTest::testContarUsuariosActivos":0.001}}
